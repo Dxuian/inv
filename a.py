@@ -294,7 +294,9 @@ def save_as_csv_after_using_mftool_test_py_file():
                 if not matching_schemes.empty:
                     best_match = matching_schemes.iloc[0]  # Get the best match
                     scheme_code = best_match['scheme_code']
-                    print(f"Matched to scheme code: {scheme_code}")
+                    match_score = best_match['match_score']
+                    match_type = best_match['match_type']
+                    print(f"Matched to scheme code: {scheme_code} (match score: {match_score}, type: {match_type})")
                     
                     try:
                         # Get all available data using mftool
@@ -315,6 +317,42 @@ def save_as_csv_after_using_mftool_test_py_file():
                             # Calculate daily returns
                             nav_data['daily_returns'] = nav_data['nav'].pct_change()
                             
+                            # Get benchmark returns (using NIFTY 50 as default benchmark)
+                            try:
+                                benchmark_details = mf.get_scheme_historical_nav('120716', as_Dataframe=True)  # NIFTY 50 TRI
+                                if isinstance(benchmark_details, pd.DataFrame):
+                                    benchmark_data = benchmark_details.copy()
+                                    benchmark_data['nav'] = pd.to_numeric(benchmark_data['nav'], errors='coerce')
+                                    benchmark_data['daily_returns'] = benchmark_data['nav'].pct_change()
+                                    
+                                    # Align fund and benchmark data
+                                    common_dates = nav_data.index.intersection(benchmark_data.index)
+                                    if len(common_dates) > 0:
+                                        aligned_fund = nav_data.loc[common_dates]
+                                        aligned_benchmark = benchmark_data.loc[common_dates]
+                                        
+                                        # Calculate up and down periods
+                                        up_periods = aligned_benchmark['daily_returns'] > 0
+                                        down_periods = aligned_benchmark['daily_returns'] < 0
+                                        
+                                        # Calculate capture ratios
+                                        if up_periods.any():
+                                            upside_capture = (aligned_fund.loc[up_periods, 'daily_returns'].mean() / 
+                                                            aligned_benchmark.loc[up_periods, 'daily_returns'].mean()) * 100
+                                        else:
+                                            upside_capture = 'N/A'
+                                            
+                                        if down_periods.any():
+                                            downside_capture = (aligned_fund.loc[down_periods, 'daily_returns'].mean() / 
+                                                             aligned_benchmark.loc[down_periods, 'daily_returns'].mean()) * 100
+                                        else:
+                                            downside_capture = 'N/A'
+                                else:
+                                    upside_capture = downside_capture = 'N/A'
+                            except Exception as e:
+                                logger.error(f"Error calculating capture ratios: {str(e)}")
+                                upside_capture = downside_capture = 'N/A'
+                            
                             # Risk metrics
                             risk_free_rate = 0.04  # Assuming 4% risk-free rate
                             volatility = nav_data['daily_returns'].std() * np.sqrt(252) * 100
@@ -324,6 +362,8 @@ def save_as_csv_after_using_mftool_test_py_file():
                                 **row.to_dict(),  # Include original data
                                 'scheme_codecomp': scheme_code,
                                 'scheme_namecomp': details.get('scheme_name', 'N/A'),
+                                'match_score': match_score,
+                                'match_type': match_type,
                                 'fund_housecomp': details.get('fund_house', 'N/A'),
                                 'scheme_typecomp': details.get('scheme_type', 'N/A'),
                                 'scheme_categorycomp': details.get('scheme_category', 'N/A'),
@@ -343,6 +383,8 @@ def save_as_csv_after_using_mftool_test_py_file():
                                 'nav_std': nav_data['nav'].std(),
                                 'nav_min': nav_data['nav'].min(),
                                 'nav_max': nav_data['nav'].max(),
+                                'upside_capture': round(upside_capture, 2) if isinstance(upside_capture, (int, float)) else upside_capture,
+                                'downside_capture': round(downside_capture, 2) if isinstance(downside_capture, (int, float)) else downside_capture,
                                 'processed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             }
                         else:
@@ -367,7 +409,7 @@ def save_as_csv_after_using_mftool_test_py_file():
                             'processed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             **{k: 'N/A' for k in ['scheme_name', 'fund_house', 'scheme_type', 'scheme_category', 
                                                 'current_nav', 'last_updated', '1y_return', '3y_return', 'volatility', 
-                                                'sharpe', 'max_drawdown', 'skewness', 'kurtosis']}
+                                                'sharpe', 'max_drawdown', 'skewness', 'kurtosis', 'upside_capture', 'downside_capture']}
                         }
                 else:
                     # If no match found, include original data with N/A for new fields
@@ -496,7 +538,6 @@ def find_matching_schemes_optimized(fund_name, processed_schemes_df):
                 'match_type': 'hash_match',
                 'match_score': 100
             })
-            continue  # Move to next scheme if hash matches
         
         # Method 2: Word set matching
         common_words = len(clean_fund_words.intersection(row['clean_words']))
@@ -510,7 +551,6 @@ def find_matching_schemes_optimized(fund_name, processed_schemes_df):
                     'match_type': 'word_similarity',
                     'match_score': round(similarity_score, 2)
                 })
-                continue
         
         # Method 3: Component matching (if no match found yet)
         full_word_match = len(fund_full_set.intersection(row['full_words']))
@@ -528,7 +568,6 @@ def find_matching_schemes_optimized(fund_name, processed_schemes_df):
                     'match_type': 'component_match',
                     'match_score': round(match_score, 2)
                 })
-                continue
         
         # Method 4: No small words comparison
         if clean_fund_no_small:
@@ -542,7 +581,6 @@ def find_matching_schemes_optimized(fund_name, processed_schemes_df):
                     'match_type': 'no_small_words',
                     'match_score': round(similarity_score, 2)
                 })
-                continue
         
         # Method 5: No spaces comparison
         similarity_score = difflib.SequenceMatcher(None, clean_fund_no_space, row['clean_no_space']).ratio() * 100
@@ -550,11 +588,9 @@ def find_matching_schemes_optimized(fund_name, processed_schemes_df):
             matches.append({
                 'original_name': fund_name,
                 'scheme_code': row['scheme_code'],
-                'scheme_name': row['scheme_name'],
-                'match_type': 'no_spaces',
-                'match_score': round(similarity_score, 2)
-            })
-            continue
+                'scheme_name': row['scheme_name'],                    'match_type': 'no_spaces',
+                    'match_score': round(similarity_score, 2)
+                })
     
     # Convert to DataFrame and sort by match score
     matches_df = pd.DataFrame(matches) if matches else pd.DataFrame()
