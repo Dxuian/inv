@@ -5,7 +5,9 @@ from datetime import datetime, timedelta
 import numpy as np
 import difflib
 import difflib
-
+import logging  
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)    
 def create_name_hash(words, original_text):
     # First detect acronyms from original text using capital letters
     acronyms = re.findall(r'\b[A-Z]{2,}\b', original_text)
@@ -247,7 +249,8 @@ def find_matching_schemes(fund_name, schemes_df):
 
 def save_as_csv_after_using_mftool_test_py_file():
     """
-    Function to enhance a.csv with additional metrics and save as ll.csv
+    Function to enhance a.csv with additional metrics and save incrementally to ll.csv
+    Supports resuming from last processed fund
     """
     try:
         # Initialize mftool
@@ -260,117 +263,150 @@ def save_as_csv_after_using_mftool_test_py_file():
         
         # Read original data
         original_df = pd.read_csv('a.csv')
-        print(f"Processing {len(original_df)} funds...")
+        total_funds = len(original_df)
+        print(f"Total funds to process: {total_funds}")
         
-        # Create new dataframe for enhanced metrics
-        enhanced_data = []
-        
-        for _, row in original_df.iterrows():
+        # Check for existing progress
+        try:
+            existing_df = pd.read_csv('ll.csv')
+            processed_funds = set(existing_df['name'].tolist())
+            print(f"Found {len(processed_funds)} already processed funds")
+            enhanced_data = existing_df.to_dict('records')
+        except FileNotFoundError:
+            existing_df = pd.DataFrame()
+            processed_funds = set()
+            enhanced_data = []
+            print("Starting fresh processing")
+
+        # Process each fund
+        for idx, row in original_df.iterrows():
             fund_name = row['name']
+            
+            # Skip if already processed
+            if fund_name in processed_funds:
+                print(f"Skipping already processed fund: {fund_name}")
+                continue
+
+            print(f"\nProcessing {idx + 1}/{total_funds}: {fund_name}")
             matching_schemes = find_matching_schemes(fund_name, schemes_df)
             
-            if not matching_schemes.empty:
-                best_match = matching_schemes.iloc[0]  # Get the best match
-                scheme_code = best_match['scheme_code']
-                print(f"Processing {fund_name} (matched to {scheme_code})")
-                
-                try:
-                    # Get all available data using mftool
-                    details = mf.get_scheme_details(scheme_code)
-                    quote = mf.get_scheme_quote(scheme_code)
-                    historical_nav = mf.get_scheme_historical_nav(scheme_code, as_Dataframe=True)
+            try:
+                if not matching_schemes.empty:
+                    best_match = matching_schemes.iloc[0]  # Get the best match
+                    scheme_code = best_match['scheme_code']
+                    print(f"Matched to scheme code: {scheme_code}")
                     
-                    # Process historical NAV data
-                    if isinstance(historical_nav, pd.DataFrame) and not historical_nav.empty:
-                        nav_data = historical_nav.copy()
-                        nav_data['nav'] = pd.to_numeric(nav_data['nav'], errors='coerce')
+                    try:
+                        # Get all available data using mftool
+                        details = mf.get_scheme_details(scheme_code)
+                        quote = mf.get_scheme_quote(scheme_code)
+                        historical_nav = mf.get_scheme_historical_nav(scheme_code, as_Dataframe=True)
                         
-                        # Calculate metrics
-                        latest_nav = nav_data['nav'].iloc[0]
-                        year_ago_nav = nav_data['nav'][nav_data.index >= (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')].iloc[-1]
-                        three_year_nav = nav_data['nav'][nav_data.index >= (datetime.now() - timedelta(days=3*365)).strftime('%d-%m-%Y')].iloc[-1]
-                        
-                        # Calculate daily returns
-                        nav_data['daily_returns'] = nav_data['nav'].pct_change()
-                        
-                        # Risk metrics
-                        risk_free_rate = 0.04  # Assuming 4% risk-free rate
-                        volatility = nav_data['daily_returns'].std() * np.sqrt(252) * 100
-                        
-                        # Create enhanced metrics dictionary
+                        # Process historical NAV data
+                        if isinstance(historical_nav, pd.DataFrame) and not historical_nav.empty:
+                            nav_data = historical_nav.copy()
+                            nav_data['nav'] = pd.to_numeric(nav_data['nav'], errors='coerce')
+                            
+                            # Calculate metrics
+                            latest_nav = nav_data['nav'].iloc[0]
+                            year_ago_nav = nav_data['nav'][nav_data.index >= (datetime.now() - timedelta(days=365)).strftime('%d-%m-%Y')].iloc[-1]
+                            three_year_nav = nav_data['nav'][nav_data.index >= (datetime.now() - timedelta(days=3*365)).strftime('%d-%m-%Y')].iloc[-1]
+                            
+                            # Calculate daily returns
+                            nav_data['daily_returns'] = nav_data['nav'].pct_change()
+                            
+                            # Risk metrics
+                            risk_free_rate = 0.04  # Assuming 4% risk-free rate
+                            volatility = nav_data['daily_returns'].std() * np.sqrt(252) * 100
+                            
+                            # Create enhanced metrics dictionary
+                            fund_metrics = {
+                                **row.to_dict(),  # Include original data
+                                'scheme_code': scheme_code,
+                                'scheme_name': details.get('scheme_name', 'N/A'),
+                                'fund_house': details.get('fund_house', 'N/A'),
+                                'scheme_type': details.get('scheme_type', 'N/A'),
+                                'scheme_category': details.get('scheme_category', 'N/A'),
+                                'start_date': details.get('scheme_start_date', {}).get('date', 'N/A'),
+                                'start_nav': details.get('scheme_start_date', {}).get('nav', 'N/A'),
+                                'current_nav': quote.get('nav', 'N/A') if quote else 'N/A',
+                                'last_updated': quote.get('last_updated', 'N/A') if quote else 'N/A',
+                                '1y_return': ((latest_nav / year_ago_nav) - 1) * 100 if year_ago_nav else 'N/A',
+                                '3y_return': (((latest_nav / three_year_nav) ** (1/3)) - 1) * 100 if three_year_nav else 'N/A',
+                                'volatility': volatility,
+                                'sharpe': ((nav_data['daily_returns'].mean() * 252 - risk_free_rate) / 
+                                        (volatility / 100)) if volatility > 0 else 'N/A',
+                                'max_drawdown': ((nav_data['nav'].cummax() - nav_data['nav']) / nav_data['nav'].cummax()).max() * 100,
+                                'skewness': nav_data['daily_returns'].skew(),
+                                'kurtosis': nav_data['daily_returns'].kurtosis(),
+                                'nav_mean': nav_data['nav'].mean(),
+                                'nav_std': nav_data['nav'].std(),
+                                'nav_min': nav_data['nav'].min(),
+                                'nav_max': nav_data['nav'].max(),
+                                'processed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            }
+                        else:
+                            # Basic metrics if historical data is not available
+                            fund_metrics = {
+                                **row.to_dict(),  # Include original data
+                                'scheme_code': scheme_code,
+                                'scheme_name': details.get('scheme_name', 'N/A'),
+                                'fund_house': details.get('fund_house', 'N/A'),
+                                'scheme_type': details.get('scheme_type', 'N/A'),
+                                'scheme_category': details.get('scheme_category', 'N/A'),
+                                'current_nav': quote.get('nav', 'N/A') if quote else 'N/A',
+                                'last_updated': quote.get('last_updated', 'N/A') if quote else 'N/A',
+                                'processed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            }
+                    except Exception as e:
+                        print(f"Error getting data for fund {fund_name}: {str(e)}")
                         fund_metrics = {
-                            **row.to_dict(),  # Include original data
+                            **row.to_dict(),
                             'scheme_code': scheme_code,
-                            'scheme_name': details.get('scheme_name', 'N/A'),
-                            'fund_house': details.get('fund_house', 'N/A'),
-                            'scheme_type': details.get('scheme_type', 'N/A'),
-                            'scheme_category': details.get('scheme_category', 'N/A'),
-                            'start_date': details.get('scheme_start_date', {}).get('date', 'N/A'),
-                            'start_nav': details.get('scheme_start_date', {}).get('nav', 'N/A'),
-                            'current_nav': quote.get('nav', 'N/A') if quote else 'N/A',
-                            'last_updated': quote.get('last_updated', 'N/A') if quote else 'N/A',
-                            # '1y_return': ((latest_nav / year_ago_nav) - 1) * 100 if year_ago_nav else 'N/A',
-                            # '3y_return': (((latest_nav / three_year_nav) ** (1/3)) - 1) * 100 if three_year_nav else 'N/A',
-                            # 'volatility': volatility,
-                            # 'sharpe': ((nav_data['daily_returns'].mean() * 252 - risk_free_rate) / 
-                            #          (volatility / 100)) if volatility > 0 else 'N/A',
-                            # 'max_drawdown': ((nav_data['nav'].cummax() - nav_data['nav']) / nav_data['nav'].cummax()).max() * 100,
-                            'skewness': nav_data['daily_returns'].skew(),
-                            'kurtosis': nav_data['daily_returns'].kurtosis(),
-                            'nav_mean': nav_data['nav'].mean(),
-                            'nav_std': nav_data['nav'].std(),
-                            'nav_min': nav_data['nav'].min(),
-                            'nav_max': nav_data['nav'].max()
+                            'error': str(e),
+                            'processed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            **{k: 'N/A' for k in ['scheme_name', 'fund_house', 'scheme_type', 'scheme_category', 
+                                                'current_nav', 'last_updated', '1y_return', '3y_return', 'volatility', 
+                                                'sharpe', 'max_drawdown', 'skewness', 'kurtosis']}
                         }
-                    else:
-                        # Basic metrics if historical data is not available
-                        fund_metrics = {
-                            **row.to_dict(),  # Include original data
-                            'scheme_code': scheme_code,
-                            'scheme_name': details.get('scheme_name', 'N/A'),
-                            'fund_house': details.get('fund_house', 'N/A'),
-                            'scheme_type': details.get('scheme_type', 'N/A'),
-                            'scheme_category': details.get('scheme_category', 'N/A'),
-                            'current_nav': quote.get('nav', 'N/A') if quote else 'N/A',
-                            'last_updated': quote.get('last_updated', 'N/A') if quote else 'N/A'
-                        }
-                    
-                    enhanced_data.append(fund_metrics)
-                    
-                except Exception as e:
-                    print(f"Error processing fund {fund_name}: {str(e)}")
-                    # Add row with basic info and N/A for metrics
-                    enhanced_data.append({
+                else:
+                    # If no match found, include original data with N/A for new fields
+                    fund_metrics = {
                         **row.to_dict(),
-                        'scheme_code': scheme_code,
-                        'error': str(e),
+                        'scheme_code': 'N/A',
+                        'match_found': False,
+                        'processed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         **{k: 'N/A' for k in ['scheme_name', 'fund_house', 'scheme_type', 'scheme_category', 
                                             'current_nav', 'last_updated', '1y_return', '3y_return', 'volatility', 
                                             'sharpe', 'max_drawdown', 'skewness', 'kurtosis']}
-                    })
-            else:
-                # If no match found, include original data with N/A for new fields
-                enhanced_data.append({
-                    **row.to_dict(),
-                    'scheme_code': 'N/A',
-                    'match_found': False,
-                    **{k: 'N/A' for k in ['scheme_name', 'fund_house', 'scheme_type', 'scheme_category', 
-                                        'current_nav', 'last_updated', '1y_return', '3y_return', 'volatility', 
-                                        'sharpe', 'max_drawdown', 'skewness', 'kurtosis']}
-                })
-        
-        # Convert to DataFrame and save
-        enhanced_df = pd.DataFrame(enhanced_data)
-        enhanced_df.to_csv('ll.csv', index=False)
-        print(f"\nEnhanced data saved to ll.csv with {len(enhanced_df)} rows")
+                    }
+                
+                # Add to enhanced data and save progress
+                enhanced_data.append(fund_metrics)
+                enhanced_df = pd.DataFrame(enhanced_data)
+                enhanced_df.to_csv('ll.csv', index=False)
+                processed_funds.add(fund_name)
+                
+                print(f"Progress: {len(processed_funds)}/{total_funds} funds processed")
+                
+            except Exception as e:
+                print(f"Error processing fund {fund_name}: {str(e)}")
+                continue  # Continue with next fund on error
+            logger.critical(f"Processed fund: {fund_name} with scheme code: {fund_metrics.get('scheme_code', 'N/A')}")
+        # print(f"\nProcessing complete! Enhanced data saved to ll.csv with {len(processed_funds)} processed funds")
         
         # Print summary statistics
-        success_count = enhanced_df['scheme_code'].ne('N/A').sum()
-        print(f"Successfully processed: {success_count} funds")
-        print(f"Failed to match: {len(enhanced_df) - success_count} funds")
+        success_count = sum(1 for d in enhanced_data if d['scheme_code'] != 'N/A')
+        print(f"Successfully matched: {success_count} funds")
+        print(f"Failed to match: {len(enhanced_data) - success_count} funds")
         
     except Exception as e:
-        print(f"Error in save_as_csv_after_using_mftool_test_py_file: {str(e)}")
+        print(f"Fatal error in save_as_csv_after_using_mftool_test_py_file: {str(e)}")
+        # Save current progress even if fatal error occurs
+        if enhanced_data:
+            pd.DataFrame(enhanced_data).to_csv('ll.csv', index=False)
+            print("Progress saved despite error")
+        raise  # Re-raise the exception for proper error handling
 
 # Initialize MF tool
 mf = Mftool()
@@ -387,39 +423,7 @@ print(f"Total funds in a.csv: {len(funds_df)}")
 
 # Create a list to store fund information
 fund_info_list = []
-
-# Process each fund name from a.csv
-# for fund_name in funds_df['name'].unique():
-#     # Search for matching schemes using improved matching logic
-#     matching_schemes = find_matching_schemes(fund_name, schemes_df)
-    
-#     if not matching_schemes.empty:
-#         print(f"\nMatches found for {fund_name}:")
-#         print(matching_schemes[['original_name', 'scheme_name', 'match_score']].to_string())
-        
-#         for _, scheme in matching_schemes.iterrows():
-#             try:
-#                 # Get scheme information
-#                 info = mf.get_scheme_quote(scheme['scheme_code'])
-#                 if info:
-#                     info['original_name'] = scheme['original_name']  # Use the original name from matches
-#                     fund_info_list.append(info)
-#                     print(f"Found info for: {scheme['original_name']}")
-                    
-#                     # Get historical NAV
-#                     hist = mf.get_scheme_historical_nav(scheme['scheme_code'], as_Dataframe=True)
-#                     if not hist.empty:
-#                         print(f"Latest NAV data:\n{hist.tail(1)}")
-                    
-#             except Exception as e:
-#                 print(f"Error processing {fund_name}: {str(e)}")
-#     else:
-#         print(f"No matching scheme found for: {fund_name}")
-    
-    # Call the function to save enhanced metrics
 save_as_csv_after_using_mftool_test_py_file()
-
-# Convert results to DataFrame
 if fund_info_list:
     results_df = pd.DataFrame(fund_info_list)
     print("\nSummary of found funds:")
