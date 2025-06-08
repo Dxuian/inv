@@ -117,7 +117,7 @@ def build_regex_pattern(fund_name):
 def find_matching_schemes(fund_name, schemes_df):
     pattern = build_regex_pattern(fund_name)
     matches = []
-    
+    start_time = datetime.now() 
     # Method 1: Regex matching with basic cleaning
     if pattern:
         fund_words = set(clean_fund_name(fund_name).split())
@@ -244,7 +244,7 @@ def find_matching_schemes(fund_name, schemes_df):
     matches_df = pd.DataFrame(matches) if matches else pd.DataFrame()
     if not matches_df.empty:
         matches_df = matches_df.sort_values('match_score', ascending=False)
-    
+    logger.info(f'time taken to find matches: {datetime.now() - start_time}')
     return matches_df
 
 def save_as_csv_after_using_mftool_test_py_file():
@@ -359,7 +359,7 @@ def save_as_csv_after_using_mftool_test_py_file():
                                 'processed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             }
                     except Exception as e:
-                        print(f"Error getting data for fund {fund_name}: {str(e)}")
+                        logger.error(f"Error getting data for fund {fund_name}: {str(e)}")
                         fund_metrics = {
                             **row.to_dict(),
                             'scheme_code': scheme_code,
