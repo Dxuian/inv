@@ -288,7 +288,7 @@ def save_as_csv_after_using_mftool_test_py_file():
                 continue
 
             print(f"\nProcessing {idx + 1}/{total_funds}: {fund_name}")
-            matching_schemes = find_matching_schemes(fund_name, schemes_df)
+            matching_schemes = find_matching_schemes_optimized(fund_name, processed_schemes_df)
             
             try:
                 if not matching_schemes.empty:
@@ -322,11 +322,11 @@ def save_as_csv_after_using_mftool_test_py_file():
                             # Create enhanced metrics dictionary
                             fund_metrics = {
                                 **row.to_dict(),  # Include original data
-                                'scheme_code': scheme_code,
-                                'scheme_name': details.get('scheme_name', 'N/A'),
-                                'fund_house': details.get('fund_house', 'N/A'),
-                                'scheme_type': details.get('scheme_type', 'N/A'),
-                                'scheme_category': details.get('scheme_category', 'N/A'),
+                                'scheme_codecomp': scheme_code,
+                                'scheme_namecomp': details.get('scheme_name', 'N/A'),
+                                'fund_housecomp': details.get('fund_house', 'N/A'),
+                                'scheme_typecomp': details.get('scheme_type', 'N/A'),
+                                'scheme_categorycomp': details.get('scheme_category', 'N/A'),
                                 'start_date': details.get('scheme_start_date', {}).get('date', 'N/A'),
                                 'start_nav': details.get('scheme_start_date', {}).get('nav', 'N/A'),
                                 'current_nav': quote.get('nav', 'N/A') if quote else 'N/A',
@@ -334,7 +334,7 @@ def save_as_csv_after_using_mftool_test_py_file():
                                 '1y_return': ((latest_nav / year_ago_nav) - 1) * 100 if year_ago_nav else 'N/A',
                                 '3y_return': (((latest_nav / three_year_nav) ** (1/3)) - 1) * 100 if three_year_nav else 'N/A',
                                 'volatility': volatility,
-                                'sharpe': ((nav_data['daily_returns'].mean() * 252 - risk_free_rate) / 
+                                'sharpe_computes': ((nav_data['daily_returns'].mean() * 252 - risk_free_rate) / 
                                         (volatility / 100)) if volatility > 0 else 'N/A',
                                 'max_drawdown': ((nav_data['nav'].cummax() - nav_data['nav']) / nav_data['nav'].cummax()).max() * 100,
                                 'skewness': nav_data['daily_returns'].skew(),
@@ -408,14 +408,173 @@ def save_as_csv_after_using_mftool_test_py_file():
             print("Progress saved despite error")
         raise  # Re-raise the exception for proper error handling
 
+def preprocess_schemes(schemes_df):
+    """
+    Precompute all necessary data for schemes to optimize matching
+    """
+    # Initialize new columns
+    processed_data = []
+    logger.info("Starting schemes preprocessing...")
+    
+    for idx, row in schemes_df.iterrows():
+        # Clean scheme name
+        clean_scheme = row['scheme_name']
+        for char in ['+', '_', '-', '(', ')', '/', '&', '.', ',']:
+            clean_scheme = clean_scheme.replace(char, ' ')
+        
+        # Get words (lowercase for general comparison)
+        scheme_words = [word.lower() for word in clean_scheme.split() if word]
+        
+        # Get hash and other components
+        scheme_hash, scheme_full, scheme_abbrev, scheme_acronyms = create_name_hash(scheme_words, clean_scheme)
+        
+        # Also compute clean name variations for other matching methods
+        clean_name = clean_fund_name(row['scheme_name'])
+        clean_no_small = set(word for word in clean_name.split() if len(word) > 2)
+        clean_no_space = ''.join(clean_name.split())
+        clean_alphanumeric = re.sub(r'[^a-z0-9]', '', clean_name)
+        
+        # Store all preprocessed data
+        processed_data.append({
+            'scheme_code': row['scheme_code'],
+            'scheme_name': row['scheme_name'],
+            'clean_name': clean_name,
+            'clean_words': set(clean_name.split()),
+            'clean_no_small': clean_no_small,
+            'clean_no_space': clean_no_space,
+            'clean_alphanumeric': clean_alphanumeric,
+            'name_hash': scheme_hash,
+            'full_words': set(scheme_full),
+            'abbrev_words': set(scheme_abbrev),
+            'acronyms': set(scheme_acronyms)
+        })
+    
+    # Convert to DataFrame
+    processed_df = pd.DataFrame(processed_data)
+    logger.info(f"Completed preprocessing {len(processed_df)} schemes")
+    return processed_df
+
+def find_matching_schemes_optimized(fund_name, processed_schemes_df):
+    """
+    Optimized version using preprocessed scheme data
+    """
+    matches = []
+    start_time = datetime.now()
+
+    # Clean fund name once
+    clean_fund = fund_name
+    for char in ['+', '_', '-', '(', ')', '/', '&', '.', ',']:
+        clean_fund = clean_fund.replace(char, ' ')
+    
+    # Get fund components (compute once)
+    fund_words = [word.lower() for word in clean_fund.split() if word]
+    fund_hash, fund_full, fund_abbrev, fund_acronyms = create_name_hash(fund_words, clean_fund)
+    
+    # Precompute fund word sets
+    fund_full_set = set(fund_full)
+    fund_abbrev_set = set(fund_abbrev)
+    fund_acronyms_set = set(fund_acronyms)
+    
+    # Clean fund variations (compute once)
+    clean_fund_name_var = clean_fund_name(fund_name)
+    clean_fund_words = set(clean_fund_name_var.split())
+    clean_fund_no_small = set(word for word in clean_fund_name_var.split() if len(word) > 2)
+    clean_fund_no_space = ''.join(clean_fund_name_var.split())
+    clean_fund_alphanumeric = re.sub(r'[^a-z0-9]', '', clean_fund_name_var)
+    
+    for idx, row in processed_schemes_df.iterrows():
+        match_found = False
+        match_score = 0
+        match_type = ''
+        
+        # Method 1: Hash matching (fastest)
+        if fund_hash == row['name_hash']:
+            matches.append({
+                'original_name': fund_name,
+                'scheme_code': row['scheme_code'],
+                'scheme_name': row['scheme_name'],
+                'match_type': 'hash_match',
+                'match_score': 100
+            })
+            continue  # Move to next scheme if hash matches
+        
+        # Method 2: Word set matching
+        common_words = len(clean_fund_words.intersection(row['clean_words']))
+        if len(clean_fund_words) > 0:
+            similarity_score = (common_words / len(clean_fund_words)) * 100
+            if similarity_score >= 80:
+                matches.append({
+                    'original_name': fund_name,
+                    'scheme_code': row['scheme_code'],
+                    'scheme_name': row['scheme_name'],
+                    'match_type': 'word_similarity',
+                    'match_score': round(similarity_score, 2)
+                })
+                continue
+        
+        # Method 3: Component matching (if no match found yet)
+        full_word_match = len(fund_full_set.intersection(row['full_words']))
+        abbrev_match = len(fund_abbrev_set.intersection(row['abbrev_words']))
+        acronym_match = len(fund_acronyms_set.intersection(row['acronyms']))
+        
+        total_words = len(fund_full) + len(fund_abbrev)
+        if total_words > 0:
+            match_score = ((full_word_match + abbrev_match + (acronym_match * 1.5)) / total_words * 100)
+            if match_score >= 80:
+                matches.append({
+                    'original_name': fund_name,
+                    'scheme_code': row['scheme_code'],
+                    'scheme_name': row['scheme_name'],
+                    'match_type': 'component_match',
+                    'match_score': round(match_score, 2)
+                })
+                continue
+        
+        # Method 4: No small words comparison
+        if clean_fund_no_small:
+            common_words = len(clean_fund_no_small.intersection(row['clean_no_small']))
+            similarity_score = (common_words / len(clean_fund_no_small)) * 100
+            if similarity_score >= 80:
+                matches.append({
+                    'original_name': fund_name,
+                    'scheme_code': row['scheme_code'],
+                    'scheme_name': row['scheme_name'],
+                    'match_type': 'no_small_words',
+                    'match_score': round(similarity_score, 2)
+                })
+                continue
+        
+        # Method 5: No spaces comparison
+        similarity_score = difflib.SequenceMatcher(None, clean_fund_no_space, row['clean_no_space']).ratio() * 100
+        if similarity_score >= 80:
+            matches.append({
+                'original_name': fund_name,
+                'scheme_code': row['scheme_code'],
+                'scheme_name': row['scheme_name'],
+                'match_type': 'no_spaces',
+                'match_score': round(similarity_score, 2)
+            })
+            continue
+    
+    # Convert to DataFrame and sort by match score
+    matches_df = pd.DataFrame(matches) if matches else pd.DataFrame()
+    if not matches_df.empty:
+        matches_df = matches_df.sort_values('match_score', ascending=False)
+    
+    logger.info(f'time taken to find matches: {datetime.now() - start_time}')
+    return matches_df
+
 # Initialize MF tool
 mf = Mftool()
 
-# Convert scheme codes to DataFrame
+# Convert scheme codes to DataFrame and preprocess
 codes = mf.get_scheme_codes()
-schemes_df = pd.DataFrame.from_dict(codes, orient='index', columns=['scheme_name'])
-schemes_df.index.name = 'scheme_code'
-schemes_df.reset_index(inplace=True)
+schemes_df = pd.DataFrame([(code, name) for code, name in codes.items()],
+                         columns=['scheme_code', 'scheme_name'])
+
+# Preprocess all scheme data for faster matching
+processed_schemes_df = preprocess_schemes(schemes_df)
+logger.info("Scheme data preprocessing complete")
 
 # Read fund names from a.csv
 funds_df = pd.read_csv('a.csv')
